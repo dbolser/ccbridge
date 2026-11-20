@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import subprocess
 import threading
 import time
@@ -27,7 +28,7 @@ WORKDIR = Path(__file__).resolve().parent / "workspace"
 SUBJECT_RE = re.compile(r"^\s*(re:\s*)*claude code\s*:", re.I)
 SEEN_LABEL = "ccbridge"
 BRIDGE_HEADER = "X-CCBridge"
-SEARCH = f'in:sent to:me subject:(claude code) newer_than:1d -label:{SEEN_LABEL}'
+SEARCH = f'in:sent to:me subject:(claude code) -label:{SEEN_LABEL}'
 POLL_SECONDS = 30
 JOB_TIMEOUT = 60 * 60
 
@@ -48,7 +49,9 @@ def save_session(thread_id: str, session_id: str) -> None:
         sessions = load_sessions()
         sessions[thread_id] = session_id
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(sessions, indent=1))
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sessions, indent=1))
+        tmp.replace(STATE_FILE)  # atomic, so readers never see a half-written file
 
 
 def body_text(msg: EmailMessage) -> str:
@@ -111,7 +114,8 @@ def poll(imap: imaplib.IMAP4_SSL) -> None:
         _, parts = imap.uid("FETCH", uid, "(X-GM-LABELS X-GM-THRID BODY.PEEK[])")
         meta, raw = parts[0][0].decode(), parts[0][1]
         # Mark first: a crash must never re-run a job (at-most-once).
-        imap.uid("STORE", uid, "+X-GM-LABELS", f"({SEEN_LABEL})")
+        if imap.uid("STORE", uid, "+X-GM-LABELS", f"({SEEN_LABEL})")[0] != "OK":
+            raise RuntimeError(f"could not label message {uid!r}")
         msg = email.message_from_bytes(raw, policy=email.policy.default)
         if not re.search(r"X-GM-LABELS \([^)]*\\Sent", meta):  # only mail from this account
             continue
@@ -137,7 +141,7 @@ def main() -> None:
     password = PASSWORD_FILE.read_text().strip()
     while True:
         try:
-            with imaplib.IMAP4_SSL("imap.gmail.com") as imap:
+            with imaplib.IMAP4_SSL("imap.gmail.com", ssl_context=ssl.create_default_context()) as imap:
                 imap.login(ADDRESS, password)
                 log.info("connected, polling every %ss", POLL_SECONDS)
                 while True:

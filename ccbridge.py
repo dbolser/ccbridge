@@ -110,7 +110,8 @@ def handle(thread_id: str, msg: EmailMessage) -> None:
 def poll(imap: imaplib.IMAP4_SSL) -> None:
     imap.select('"[Gmail]/All Mail"')
     _, data = imap.uid("SEARCH", "X-GM-RAW", f'"{SEARCH}"')
-    for uid in data[0].split():
+    jobs: dict[str, list[EmailMessage]] = {}
+    for uid in data[0].split():  # UIDs ascend, so each thread's list is in send order
         _, parts = imap.uid("FETCH", uid, "(X-GM-LABELS X-GM-THRID BODY.PEEK[])")
         meta, raw = parts[0][0].decode(), parts[0][1]
         # Mark first: a crash must never re-run a job (at-most-once).
@@ -122,7 +123,14 @@ def poll(imap: imaplib.IMAP4_SSL) -> None:
         if msg[BRIDGE_HEADER] or not SUBJECT_RE.match(msg["Subject"] or ""):
             continue
         thread_id = re.search(r"X-GM-THRID (\d+)", meta).group(1)
-        threading.Thread(target=handle_safely, args=(thread_id, msg), daemon=True).start()
+        jobs.setdefault(thread_id, []).append(msg)
+    for thread_id, msgs in jobs.items():
+        threading.Thread(target=handle_in_order, args=(thread_id, msgs), daemon=True).start()
+
+
+def handle_in_order(thread_id: str, msgs: list[EmailMessage]) -> None:
+    for msg in msgs:
+        handle_safely(thread_id, msg)
 
 
 def handle_safely(thread_id: str, msg: EmailMessage) -> None:

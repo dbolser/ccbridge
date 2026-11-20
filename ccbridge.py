@@ -34,7 +34,8 @@ JOB_TIMEOUT = 60 * 60
 
 log = logging.getLogger("ccbridge")
 state_lock = threading.Lock()
-thread_locks: dict[str, threading.Lock] = {}
+queue_lock = threading.Lock()
+queues: dict[str, list[EmailMessage]] = {}  # per email thread, oldest first
 
 
 def load_sessions() -> dict:
@@ -95,23 +96,20 @@ def run_claude(prompt: str, session_id: str | None) -> tuple[str, str | None]:
 
 
 def handle(thread_id: str, msg: EmailMessage) -> None:
-    lock = thread_locks.setdefault(thread_id, threading.Lock())
-    with lock:  # follow-ups in one email thread run in order
-        prompt = f'Subject: {msg["Subject"]}\n\n{body_text(msg)}'
-        session_id = load_sessions().get(thread_id)
-        log.info("job thread=%s resume=%s subject=%r", thread_id, session_id, msg["Subject"])
-        result, new_session = run_claude(prompt, session_id)
-        if new_session:
-            save_session(thread_id, new_session)
-        send_reply(msg, result)
-        log.info("replied thread=%s", thread_id)
+    prompt = f'Subject: {msg["Subject"]}\n\n{body_text(msg)}'
+    session_id = load_sessions().get(thread_id)
+    log.info("job thread=%s resume=%s subject=%r", thread_id, session_id, msg["Subject"])
+    result, new_session = run_claude(prompt, session_id)
+    if new_session:
+        save_session(thread_id, new_session)
+    send_reply(msg, result)
+    log.info("replied thread=%s", thread_id)
 
 
 def poll(imap: imaplib.IMAP4_SSL) -> None:
     imap.select('"[Gmail]/All Mail"')
     _, data = imap.uid("SEARCH", "X-GM-RAW", f'"{SEARCH}"')
-    jobs: dict[str, list[EmailMessage]] = {}
-    for uid in data[0].split():  # UIDs ascend, so each thread's list is in send order
+    for uid in data[0].split():  # UIDs ascend, so jobs queue in send order
         _, parts = imap.uid("FETCH", uid, "(X-GM-LABELS X-GM-THRID BODY.PEEK[])")
         meta, raw = parts[0][0].decode(), parts[0][1]
         # Mark first: a crash must never re-run a job (at-most-once).
@@ -123,13 +121,26 @@ def poll(imap: imaplib.IMAP4_SSL) -> None:
         if msg[BRIDGE_HEADER] or not SUBJECT_RE.match(msg["Subject"] or ""):
             continue
         thread_id = re.search(r"X-GM-THRID (\d+)", meta).group(1)
-        jobs.setdefault(thread_id, []).append(msg)
-    for thread_id, msgs in jobs.items():
-        threading.Thread(target=handle_in_order, args=(thread_id, msgs), daemon=True).start()
+        enqueue(thread_id, msg)
 
 
-def handle_in_order(thread_id: str, msgs: list[EmailMessage]) -> None:
-    for msg in msgs:
+def enqueue(thread_id: str, msg: EmailMessage) -> None:
+    """One worker per email thread runs its jobs in order; other threads run in parallel."""
+    with queue_lock:
+        if thread_id in queues:  # a worker is already draining this thread
+            queues[thread_id].append(msg)
+            return
+        queues[thread_id] = [msg]
+    threading.Thread(target=drain, args=(thread_id,), daemon=True).start()
+
+
+def drain(thread_id: str) -> None:
+    while True:
+        with queue_lock:
+            if not queues[thread_id]:
+                del queues[thread_id]
+                return
+            msg = queues[thread_id].pop(0)
         handle_safely(thread_id, msg)
 
 

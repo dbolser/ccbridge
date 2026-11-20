@@ -25,8 +25,10 @@ trust boundary is your Gmail account.
 1. Put a Gmail app password in `~/.config/ccbridge/app_password` (mode 600),
    and set `ADDRESS` in `ccbridge.py`. Replies go out through the local
    `sendmail`, which must relay through the same Gmail account.
-2. Install the service:
+2. Install the service. It expects this repo at `~/Build/ccbridge`; edit
+   `ExecStart` in `ccbridge.service` if yours is elsewhere.
    ```bash
+   mkdir -p ~/.config/systemd/user
    cp ccbridge.service ~/.config/systemd/user/
    systemctl --user enable --now ccbridge
    ```

@@ -1,0 +1,12 @@
+[Unit]
+Description=Email bridge to Claude Code
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/Build/ccbridge/ccbridge.py
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
